@@ -1,0 +1,1045 @@
+/*IMPORTANTE: QUITADOS LOS FROMS COMO WHITELISTS*/
+
+/*  Copyright (C) 2012 by David Amor (damor4321@gmail.com)
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+#ifndef _REENTRANT
+#error Compile with -D_REENTRANT flag
+#endif
+
+
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <arpa/nameser.h>
+#include <resolv.h>
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#ifndef __sun__
+#include <getopt.h>
+#endif
+#include <grp.h>
+#include "libmilter/mfapi.h"
+#include <netinet/in.h>
+
+#include <pthread.h>
+#include <pwd.h>
+#include <regex.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <syslog.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "libdns/dns.h"
+#include "libdns/spf.h"
+#define SPF_RESULT_INVALID 2
+
+
+#define CONFIG_FILE		"/MTA/appn/etc/cfakemail/cfakemail.conf"
+#define WORK_SPACE		"/MTA/datos/var/run"
+#define OCONN			"unix:" WORK_SPACE "/cfakemail.sock"
+#define RESCONF_FILE		"/MTA/appn/etc/cfakemail/resolv.conf"
+#define TAG_STRING		"X-MYCOMPANY-FMH"
+#define SYSLOG_FACILITY	LOG_MAIL
+#define TARGET_DOMAIN_STRING	"mycompany.com"
+#define USER			"root"
+#define SPF_TTL			3600
+
+#define MAXLINE			128
+#define HASH_POWER		16
+#define FACILITIES_AMOUNT	10
+#define IPV4_DOT_DECIMAL	"^[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}$"
+#define IPV4_DOT_DECIMAL_EXTRACT	"([0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3})"
+#define SAFE_FREE(x)		if (x) { free(x); x = NULL; }
+#define hash_size(x)		((unsigned long) 1 << x)
+#define hash_mask(x)		(hash_size(x) - 1)
+#define DOMAIN_REGEXPR      "([-a-z0-9\.]*[.][-a-z0-9]*[.][-a-z0-9]*)[^-a-z0-9\.]"
+/*#define DOMAIN_REGEXPR      "[^@]([-a-z0-9\.]*[.][-a-z0-9]*[.][-a-z0-9]*)[^-a-z0-9\.]"*/ // that is not an IP address
+#define IS_IPV4             "^[^a-z]*$"
+
+
+struct {
+        const char *resconf;
+        const char *cache;
+        struct dns_resolver *res;
+} MAIN;
+
+
+typedef struct cache_item {
+    char *item;
+    unsigned long hash;
+    int status;
+    time_t exptime;
+    struct cache_item *next;
+} cache_item;
+
+
+typedef struct STR {
+    char *str;
+    struct STR *next;
+} STR;
+
+typedef struct config {
+    char *tag;
+    char *run_as_user;    
+    char *sendmail_socket;
+    int  syslog_facility;
+    STR  *target_domains;
+    STR  *internal_domains;
+    char *resconf_file;
+    unsigned long spf_ttl;
+} config;
+
+typedef struct facilities {
+    char *name;
+    int facility;
+} facilities;
+
+struct context {
+    char addr[64];
+    char fqdn[MAXLINE];
+    char site[MAXLINE];
+    char helo[MAXLINE];
+    char envfrom[MAXLINE];
+    char envfromstr[MAXLINE];
+    char mailfrom[MAXLINE];
+    char rcpt[MAXLINE];
+    char recipient[MAXLINE];
+    char key[MAXLINE];
+    STR  *rcpts;
+    STR  *received_headers;
+    STR  *last_received_header;
+    STR  *received_hdrs_dnames;
+    STR  *last_received_hdrs_dname;
+    int status;
+};
+
+static regex_t re_ipv4;
+static regex_t re_ipv4_extract;
+static regex_t re_domain;
+static regex_t re_is_ipv4;
+
+static cache_item **cache = NULL;
+static const char *config_file = CONFIG_FILE;
+static config conf;
+static pthread_mutex_t cache_mutex;
+static pthread_mutex_t spf_mutex;
+static facilities syslog_facilities[] = {
+    { "daemon", LOG_DAEMON },
+    { "mail", LOG_MAIL },
+    { "local0", LOG_LOCAL0 },
+    { "local1", LOG_LOCAL1 },
+    { "local2", LOG_LOCAL2 },
+    { "local3", LOG_LOCAL3 },
+    { "local4", LOG_LOCAL4 },
+    { "local5", LOG_LOCAL5 },
+    { "local6", LOG_LOCAL6 },
+    { "local7", LOG_LOCAL7 }
+};
+
+static sfsistat smf_connect(SMFICTX *, char *, _SOCK_ADDR *);
+static sfsistat smf_helo(SMFICTX *, char *);
+static sfsistat smf_envfrom(SMFICTX *, char **);
+static sfsistat smf_envrcpt(SMFICTX *, char **);
+static sfsistat smf_header(SMFICTX *, char *, char *);
+static sfsistat smf_eom(SMFICTX *);
+static sfsistat smf_close(SMFICTX *);
+
+static void strscpy(register char *dst, register const char *src, size_t size) {
+    register size_t i;
+
+    for (i = 0; i < size && (dst[i] = src[i]) != 0; i++) continue;
+    dst[i] = '\0';
+}
+
+static void strtolower(register char *str) {
+
+    for (; *str; str++)
+	    if (isascii(*str) && isupper(*str)) *str = tolower(*str);
+}
+
+static unsigned long translate(char *value) {
+    unsigned long unit;
+    size_t len = strlen(value);
+
+    switch (value[len - 1]) {
+	    case 'm':
+	    case 'M':
+	        unit = 60;
+	        value[len - 1] = '\0';
+	        break;
+	    case 'h':
+	    case 'H':
+	        unit = 3600;
+	        value[len - 1] = '\0';
+	        break;
+	    case 'd':
+	    case 'D':
+	        unit = 86400;
+	        value[len - 1] = '\0';
+	        break;
+	    default:
+	        return atol(value);
+    }
+    return (atol(value) * unit);
+}
+
+static void delete_list(STR *list) {
+
+    if (list) {
+	    STR *it = list, *it_next;
+	    while (it) {
+	        it_next = it->next;
+	        SAFE_FREE(it->str);
+	        SAFE_FREE(it);
+	        it = it_next;
+	    }
+	    list = NULL;
+    }
+}
+
+
+static unsigned long hash_code(register const unsigned char *key) {
+    register unsigned long hash = 0;
+    register size_t i, len = strlen(key);
+
+    for (i = 0; i < len; i++) {
+	    hash += key[i];
+	    hash += (hash << 10);
+	    hash ^= (hash >> 6);
+    }
+    hash += (hash << 3);
+    hash ^= (hash >> 11);
+    hash += (hash << 15);
+    return hash;
+}
+
+static int cache_init(void) {
+
+    if (!(cache = calloc(1, hash_size(HASH_POWER) * sizeof(void *)))) return 0;
+    return 1;
+}
+
+static void cache_destroy(void) {
+    unsigned long i, size = hash_size(HASH_POWER);
+    cache_item *it, *it_next;
+
+    for (i = 0; i < size; i++) {
+	    it = cache[i];
+	    while (it) {
+	        it_next = it->next;
+	        SAFE_FREE(it->item);
+	        SAFE_FREE(it);
+	        it = it_next;
+	    }
+    }
+    SAFE_FREE(cache);
+}
+
+static int cache_get(const char *key) {
+    unsigned long hash = hash_code(key);
+    cache_item *it = cache[hash & hash_mask(HASH_POWER)];
+    time_t curtime = time(NULL);
+
+    while (it) {
+	    if (it->hash == hash && it->exptime > curtime && it->item && !strcmp(key, it->item)) return it->status;
+	    it = it->next;
+    }
+    return SPF_RESULT_INVALID;
+}
+
+static void cache_put(const char *key, unsigned long ttl, int status) {
+    unsigned long hash = hash_code(key);
+    time_t curtime = time(NULL);
+    cache_item *it, *parent = NULL;
+
+    it = cache[hash & hash_mask(HASH_POWER)];
+    while (it) {
+	    if (it->hash == hash && it->exptime > curtime && it->item && !strcmp(key, it->item)) return;
+	    it = it->next;
+    }
+    it = cache[hash & hash_mask(HASH_POWER)];
+    while (it) {
+	    if (it->exptime < curtime) {
+	        SAFE_FREE(it->item);
+	        it->item = strdup(key);
+	        it->hash = hash;
+	        it->status = status;
+	        it->exptime = curtime + ttl;
+	        return;
+	    }
+	    parent = it;
+	    it = it->next;
+    }
+    if ((it = (cache_item *) calloc(1, sizeof(cache_item)))) {
+	    it->item = strdup(key);
+	    it->hash = hash;
+	    it->status = status;
+	    it->exptime = curtime + ttl;
+	    if (parent)
+	        parent->next = it;
+	    else
+	        cache[hash & hash_mask(HASH_POWER)] = it;
+    }
+}
+
+static void free_config(void) {
+
+    SAFE_FREE(conf.tag);
+    SAFE_FREE(conf.run_as_user);
+    SAFE_FREE(conf.sendmail_socket);
+    SAFE_FREE(conf.resconf_file);
+
+    if (conf.target_domains)    delete_list(conf.target_domains);    
+    if (conf.internal_domains)  delete_list(conf.internal_domains);
+
+}
+
+static int load_config(void) {
+    FILE *fp;
+    char buf[2 * MAXLINE];
+    
+    conf.tag = strdup(TAG_STRING);
+    conf.run_as_user = strdup(USER);
+    conf.sendmail_socket = strdup(OCONN);
+    conf.resconf_file = strdup(RESCONF_FILE);
+    conf.syslog_facility = SYSLOG_FACILITY;
+    conf.spf_ttl = SPF_TTL;
+
+    if (!(fp = fopen(config_file, "r"))) return 0;
+    while (fgets(buf, sizeof(buf) - 1, fp)) {
+	    char key[MAXLINE];
+	    char val[MAXLINE];
+	    char *p = NULL;
+
+	    if ((p = strchr(buf, '#'))) *p = '\0';
+	    if (!(strlen(buf))) continue;
+	    if (sscanf(buf, "%127s %127s", key, val) != 2) continue;
+
+
+        if (!strcasecmp(key, "targetdomain")) { 
+	        STR *it = NULL;
+
+	        if (!conf.target_domains)
+		        conf.target_domains = (STR *) calloc(1, sizeof(STR));
+	        else if ((it = (STR *) calloc(1, sizeof(STR)))) {
+		        it->next = conf.target_domains;
+		        conf.target_domains = it;
+		    }
+
+	        strtolower(val);	        
+	        if (conf.target_domains && !conf.target_domains->str) conf.target_domains->str = strdup(val);
+	        
+	        continue;
+	    }
+
+	    
+	    
+        if (!strcasecmp(key, "internaldomain")) { //DAF: Model for the InternalDomain
+	        STR *it = NULL;
+
+	        if (!conf.internal_domains)
+		        conf.internal_domains = (STR *) calloc(1, sizeof(STR));
+	        else if ((it = (STR *) calloc(1, sizeof(STR)))) {
+		        it->next = conf.internal_domains;
+		        conf.internal_domains = it;
+		    }
+	        strtolower(val);
+	        if (conf.internal_domains && !conf.internal_domains->str) conf.internal_domains->str = strdup(val);
+	        
+	        continue;
+	    }
+
+	    	    
+
+	    if (!strcasecmp(key, "tag")) {
+	        SAFE_FREE(conf.tag);
+	        conf.tag = strdup(val);
+	        continue;
+	    }
+	    
+	    if (!strcasecmp(key, "ttl")) {
+	        conf.spf_ttl = translate(val);
+	        continue;
+	    }
+	    if (!strcasecmp(key, "user")) {
+	        SAFE_FREE(conf.run_as_user);
+	        conf.run_as_user = strdup(val);
+	        continue;
+	    }
+	    if (!strcasecmp(key, "socket")) {
+	        SAFE_FREE(conf.sendmail_socket);
+	        conf.sendmail_socket = strdup(val);
+	        continue;
+	    }
+	    if (!strcasecmp(key, "resconffile")) {
+	        SAFE_FREE(conf.resconf_file);
+	        conf.resconf_file = strdup(val);
+		MAIN.resconf = strdup(val);
+		printf("ES %s\n", MAIN.resconf);
+	        continue;
+	    }
+	    if (!strcasecmp(key, "syslog")) {
+	        int i;
+	        for (i = 0; i < FACILITIES_AMOUNT; i++)
+		    if (!strcasecmp(val, syslog_facilities[i].name))
+		        conf.syslog_facility = syslog_facilities[i].facility;
+	        continue;
+	    }
+    }
+    fclose(fp);
+    
+    
+    
+    return 1;
+}
+
+
+static int internaldomain_check(const char *ptr) {
+    STR *it = conf.internal_domains;
+
+    while (it) {
+    	if (it->str && strlen(it->str) <= strlen(ptr) && !strcasecmp(ptr + strlen(ptr) - strlen(it->str), it->str)) return 1;
+	    it = it->next;
+    }
+    return 0;
+}
+
+
+
+
+static void die(const char *reason) {
+
+    syslog(LOG_ERR, "[ERROR] die: %s", reason);
+    smfi_stop();
+    sleep(60);
+    abort();
+}
+
+static void mutex_lock(pthread_mutex_t *mutex) {
+
+    if (pthread_mutex_lock(mutex)) die("pthread_mutex_lock");
+}
+
+static void mutex_unlock(pthread_mutex_t *mutex) {
+
+    if (pthread_mutex_unlock(mutex)) die("pthread_mutex_unlock");
+}
+
+static int address_preparation(register char *dst, register const char *src) {
+
+    register const char *start = NULL, *stop = NULL;
+    int tail;
+
+    if (!(start = strchr(src, '<'))) return 0;
+    if (!(stop = strrchr(src, '>'))) return 0;
+    if (++start >= --stop) return 0;
+
+    strscpy(dst, start, stop - start + 1);
+    tail = strlen(dst) - 1;
+
+    if ((dst[0] >= 0x07 && dst[0] <= 0x0d) || dst[0] == 0x20) return 0;
+    if ((dst[tail] >= 0x07 && dst[tail] <= 0x0d) || dst[tail] == 0x20) return 0;
+    if (!strchr(dst, '@')) return 0;
+
+    return 1;
+}
+
+static void add_rcpt(struct context *context) { // not currently in use
+    STR *it = NULL;
+
+    if (!context->rcpts)
+	context->rcpts = (STR *) calloc(1, sizeof(STR));
+    else
+	if ((it = (STR *) calloc(1, sizeof(STR)))) {
+	    it->next = context->rcpts;
+	    context->rcpts = it;
+	}
+    if (context->rcpts && !context->rcpts->str) context->rcpts->str = strdup(context->rcpt);
+}
+
+
+static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
+    struct context *context = NULL;
+    char host[64];
+
+    strscpy(host, "undefined", sizeof(host) - 1);
+    switch (sa->sa_family) {
+	    case AF_INET: {
+	        struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+
+	        inet_ntop(AF_INET, &sin->sin_addr.s_addr, host, sizeof(host));
+	        break;
+	    }
+	    case AF_INET6: {
+	        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+
+	        inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
+	        break;
+	    }
+    }
+
+    if (!(context = calloc(1, sizeof(*context)))) {
+	    syslog(LOG_ERR, "[ERROR] %s", strerror(errno));
+	    return SMFIS_ACCEPT;
+    }
+
+    smfi_setpriv(ctx, context);
+    strscpy(context->addr, host, sizeof(context->addr) - 1);
+    strscpy(context->fqdn, name, sizeof(context->fqdn) - 1);
+    strscpy(context->helo, "undefined", sizeof(context->helo) - 1);
+    
+    syslog(LOG_DEBUG, "Connect_Callback: From %s/%s", host, name);
+    
+    return SMFIS_CONTINUE;
+}
+
+
+
+static sfsistat smf_helo(SMFICTX *ctx, char *arg) {
+    struct context *context = (struct context *)smfi_getpriv(ctx);
+
+    strscpy(context->helo, arg, sizeof(context->helo) - 1);
+        
+    syslog(LOG_DEBUG, "HELO Callback: Heloname is %s", context->helo);
+    
+    return SMFIS_CONTINUE;
+}
+
+static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
+    
+    struct context *context = (struct context *)smfi_getpriv(ctx);
+
+    if (*args) strscpy(context->envfromstr, *args, sizeof(context->envfromstr) - 1);
+    
+    if (!address_preparation(context->envfrom, context->envfromstr)) {
+	    smfi_setreply(ctx, "550", "5.1.7", "Sender address does not conform to RFC-2821 syntax");
+	    return SMFIS_REJECT;
+    }
+
+    strtolower(context->envfromstr);    
+    strtolower(context->envfrom);
+    syslog(LOG_DEBUG, "ENVFROM_Callback: Envelope From is %s [%s]", context->envfrom , context->envfromstr);
+    
+
+    //DAF: it is possible that we remove the rcpts (because currently nothing is done with them), for now we clean here if there were   
+    //if (context->rcpts) delete_list(context->rcpts);
+    
+    return SMFIS_CONTINUE;
+
+}
+
+
+/*
+static sfsistat smf_envrcpt(SMFICTX *ctx, char **args) {
+    struct context *context = (struct context *)smfi_getpriv(ctx);
+
+    if (*args) strscpy(context->rcpt, *args, sizeof(context->rcpt) - 1);
+    if (!address_preparation(context->recipient, context->rcpt)) {
+	    smfi_setreply(ctx, "550", "5.1.3", "Recipient address does not conform to RFC-2821 syntax");
+	    return SMFIS_REJECT;
+    }
+ 	
+    //DAF: ATTENTION: THIS IS THE REJECTION IF THE QUERY SPF FAILS *: we do not reject: we only added header and CAN NOT DO IT HERE	
+	  //if (context->status == SPF_FAIL && conf.refuse_fail) {	
+	  //  char reject[2 * MAXLINE];
+    //
+	  //  snprintf(reject, sizeof(reject), "Rejected, look at http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s", context->sender, context->addr, context->site);
+	//    smfi_setreply(ctx, "550", "5.1.1", reject);
+	//    return SMFIS_REJECT;
+	//}
+		
+    return SMFIS_CONTINUE;
+}
+*/
+
+static sfsistat smf_header(SMFICTX *ctx, char *name, char *value) {
+
+    struct context *context = (struct context *)smfi_getpriv(ctx);
+
+    if (!strcasecmp(name, "From")) {
+   	 if (!address_preparation(context->mailfrom, value)) strscpy(context->mailfrom, value, sizeof(context->mailfrom) - 1);   
+	 syslog(LOG_DEBUG, "HEADER_Callback: matched MailFrom: %s : %s [%s]", name, context->mailfrom, value);
+    }
+
+    if (!strcasecmp(name, "Received")) {
+    
+        syslog(LOG_DEBUG, "HEADER_Callback: matched RECEIVED Header:[%s]", value);	    
+        STR *temp = (STR *) calloc(1, sizeof(STR));
+        temp->str = strdup(value);
+        temp->next=NULL;
+
+        if(context->last_received_header == NULL)
+        {
+          context->last_received_header = temp;
+          context->received_headers = context->last_received_header;
+        }
+        else
+        {
+          context->last_received_header->next = temp;
+          context->last_received_header = temp;
+        }
+
+    
+    }
+    
+    return SMFIS_CONTINUE;
+}
+
+static char* get_ipaddr (char *host, char *header) {
+
+    char *ipbuf;
+    struct hostent *hostentry;
+    syslog(LOG_DEBUG, "GET IP TRACE: header:[%s] host:[%s]." , header, host);
+
+
+    hostentry = gethostbyname(host);
+    if(NULL != hostentry) {
+        ipbuf = inet_ntoa(*((struct in_addr *)hostentry->h_addr_list[0]));
+        if(NULL != ipbuf){
+            syslog(LOG_DEBUG, "GET IP: Name:[%s] resolved to IP address:[%s]", host, ipbuf); 
+            return(ipbuf);
+        }
+    }
+   
+    regmatch_t matches[2];
+    if(!regexec(&re_ipv4_extract, header, 2, matches, 0)) {
+        ipbuf = strndup(header + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);
+	    syslog(LOG_DEBUG, "GET IP: IP address:[%s] from message Received headers [%s].", ipbuf, header);
+        return(ipbuf);
+	} 
+	
+	return NULL;
+}
+
+static int not_internal_domain (char *hostname) {
+
+        STR *idom = conf.internal_domains;
+        int not_internal_dn = 1;
+        while (idom) {
+        
+            if(strstr(hostname, idom->str)) {
+                not_internal_dn = 0;
+            }
+            idom = idom->next;
+        }
+
+        return not_internal_dn;       
+
+}
+
+static sfsistat smf_eom(SMFICTX *ctx) {
+    struct context *context = (struct context *)smfi_getpriv(ctx);
+
+    // Verify that the Envelope From and the Mail From match. If NOT add "X-MYCOMPANY-FMH: YES" header and end.
+    char from[MAXLINE];
+    strcpy (from, context->mailfrom);            
+    if (strcasecmp(from, context->envfrom)) { //if they are not equals
+        smfi_addheader(ctx, conf.tag, "YES");
+        syslog(LOG_INFO, "EOM_Callback: addheader %s: YES ... Because EnvFrom:[%s] is different from MailFrom:[%s]", conf.tag, context->envfrom, from);
+   	    goto accept;    			    	    	
+    }
+
+
+    // Verify that from Domain is one of the domains to inspect. If NO (it is) add "X-MYCOMPANY-FMH: NO" header and end.
+    char *pos = strchr (from, '@');
+    char domname[MAXLINE];
+    strncpy(domname, pos + 1, strlen(pos));
+
+    syslog(LOG_DEBUG, "EOM_Callback: domain is [%s]", domname);
+
+    if(!domname) { //... Attention
+        smfi_addheader(ctx, conf.tag, "NO");
+	    syslog(LOG_INFO, "EOM_Callback: addheader %s: NO ... Because %s domain is not in inspection domain list", conf.tag, from);
+	    goto accept;
+    }    
+  
+    STR *it = conf.target_domains;
+    int found = 0;
+    strtolower(domname);
+    while (it) {
+    	if (it->str && strcasestr(domname, it->str)) {
+    	    found = 1;
+    	    break;
+    	}
+	    it = it->next;
+    }
+
+        
+    if(found == 0) {
+        smfi_addheader(ctx, conf.tag, "NO");
+	    syslog(LOG_INFO, "EOM_Callback: addheader %s: NO .... Because %s domain is not in inspection domain list", conf.tag, from);
+	    goto accept;
+    }
+    
+    // Search in the Received headers the first one (it will be the most recent one) whose Host Sender does not belong to MYCOMPANY/PSMTP domains.
+    char *ip = NULL;
+    char *hostname = NULL;
+    char *rec_header = NULL;
+
+    it = context->received_headers;
+    regmatch_t matches[2];                
+
+    rec_header = strdup(it->str);
+    //printf("HEADER:[%s]\n", rec_header);
+    while (it) {
+    
+        if(!regexec(&re_domain, rec_header, 2, matches, 0)) {
+            
+            hostname = strndup(rec_header + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);
+            rec_header = strndup (rec_header + matches[1].rm_eo, strlen(rec_header) - matches[1].rm_eo);
+
+            //printf("rest:[%s] y [%d]\n", rec_header, strlen(rec_header) );
+            
+            if(regexec(&re_is_ipv4, hostname, 0, NULL, 0)) { //it is not part of an IP address
+
+                //printf("HOSTNAME:[%s]\n", hostname);
+                if( not_internal_domain(hostname) ) {
+
+                    break;
+                }
+
+
+            }
+            
+            //printf("\n\n");
+        }
+        else {
+            it = it->next;
+            if(it && it->str) {rec_header = strdup(it->str); } //printf("HEADER:[%s]\n", rec_header);}
+        }
+    }
+
+
+    if(hostname)  { //the first external machine found.
+   	
+        int status;
+        const char *site = NULL;
+        
+        
+        syslog(LOG_DEBUG, "EOM_Callback: External Sender Host: %s", hostname);
+
+	// Determinar su IP: 1º: resolucion de nombre, si NO 1º-> 2º buscarla en la header.
+  // Determine your IP adress: FIRST: name resolution, if NO FIRST -> SECOND: look for it in the header.
+	ip = get_ipaddr(hostname, rec_header);
+	printf("THE IP ADDRESS IS [%s]\n", ip);
+	//ip = get_ipaddr(hostname, it->str);
+	//SAFE_FREE(rec_header);
+  //SAFE_FREE(hostname);
+	    
+	// Si no se pudo determinar la IP: anyade "X-MYCOMPANY-FMH: YES" y termina.
+  // If the IP address could not be determined: add "X-MYCOMPANY-FMH: YES" header and end.
+	if(ip == NULL) { 				
+		smfi_addheader(ctx, conf.tag, "YES");
+		syslog(LOG_INFO, "EOM_Callback: addheader %s: YES ... Because No Name Resolution or IP address for External Server [%s]", conf.tag ,hostname);
+	    	goto accept;  						
+	}
+		
+	//SPF
+	context->status = SPF_NONE;
+	   
+	// printf("STEP_00\n");
+	// We look for an SPF response in the cache
+
+  if ((site = smfi_getsymval(ctx, "j"))) {
+    strscpy(context->site, site, sizeof(context->site) - 1);
+    // printf("STEP_01 Site:[%s]\n", site);
+  }
+  else {
+    // printf("STEP_02\n");
+    strscpy(context->site, "localhost", sizeof(context->site) - 1);
+  }
+
+	// printf("PASS: %s\nY:%s", context->addr, domname);
+  snprintf(context->key, sizeof(context->key), "%s|%s", context->addr, domname);
+
+  // printf("KEY IN CACHE [%s]\n", context->key);
+
+  if (NULL) { // FOR TESTS we are not using cache.
+    
+    //if (cache && conf.spf_ttl) {
+	      mutex_lock(&cache_mutex);
+	      status = cache_get(context->key);
+	      mutex_unlock(&cache_mutex);
+
+        //printf("STEP_10\n");
+
+	      if (status != SPF_RESULT_INVALID) {
+	        syslog(LOG_INFO, "SPF %s (cached): %s, %s, %s, %s", spf_strresult(status), context->addr, context->fqdn, context->helo, context->envfrom);
+	        context->status = status;
+	        // NOW WE HAVE A STATUS: HERE TO CALL ANALYSIS AND ADD HEADERS
+          //printf("STEP_20\n");
+	        
+	      }
+        //printf("PASA_30\n");
+
+   }
+   else { // query the SERVER
+            
+		_res.retrans = 5;
+		_res.retry = 2;
+            
+    //printf("STEP_40\n");
+	        
+	  mutex_lock(&spf_mutex);
+
+    //INICIALIZATION
+		struct spf_env env;
+		memset(&env, 0, sizeof env);
+    //printf("STEP_50\n");
+		//spf_env_init(&env, 0, ip, "", context->envfrom);
+		spf_env_init(&env, 0, ip, context->helo, context->envfrom);
+    //printf("PASA_70\n");
+		char *resconf = "/tmp/stubr/resolv.conf";
+		MAIN.resconf = resconf;
+		//MAIN.resconf = "/tmp/cfakemail/etc/mail/resolv.conf";
+		spf_setenv(&env, 83, context->envfrom);
+		spf_setenv(&env, 73, ip);
+
+    printf("PASA_70 [%s][%s][%s][%s]\n", MAIN.resconf, context->helo, context->envfrom, ip);
+    // QUERY-SCOPE IS MAILFROM
+		status = spf_my_check(&env);
+
+		// RETURN ERROR IS UNDONE... AND THEN WE WILL DO: goto spf_done;
+
+	  mutex_unlock(&spf_mutex);
+    if (status == SPF_NONE) {
+
+			//printf("STEP_90\n");
+	    syslog(LOG_INFO, "SPF none: %s, %s, %s, %s", ip, context->fqdn, context->helo, context->envfrom);
+
+	    // PUT IT IN THE CACHE
+	    if (cache && conf.spf_ttl) {
+        //printf("STEP_100\n");
+        mutex_lock(&cache_mutex);	            
+	      cache_put(context->key, conf.spf_ttl, SPF_NONE);	            
+	      mutex_unlock(&cache_mutex);	    
+	    }	            
+      //printf("STEP_110\n");
+	    goto spf_done;
+
+    }            
+
+		if((status == SPF_TEMPERROR) || (status == SPF_PERMERROR)) {
+      syslog(LOG_INFO, "SPF error: %d, %s, %s, %s, %s", status, ip, context->fqdn, context->helo, context->envfrom);
+	    goto spf_done;
+		} 
+
+    //printf("STEP_120\n");
+                    
+    // WE HAVE A REPSONSE
+    // ANALIZE RESPONSE STATUS
+    syslog(LOG_NOTICE, "SPF %s: %s, %s, %s, %s", spf_strresult(status), ip, context->fqdn, context->helo, context->envfrom);
+
+    printf("STEP_130\n");
+
+    switch (status) {
+	    case SPF_PASS:
+	    case SPF_FAIL:
+	    case SPF_SOFTFAIL:
+	    case SPF_NEUTRAL:
+	
+        printf("STEP_140\n");
+
+        //SAVE THAT STATUS IN MEMORIA AND IN THE CACHE
+	      context->status = status;
+	      if (cache && conf.spf_ttl) {
+          //printf("STEP_150\n");
+		      mutex_lock(&cache_mutex);
+		      cache_put(context->key, conf.spf_ttl, context->status);
+		      mutex_unlock(&cache_mutex);
+	      }
+	      break;
+
+	    default:
+	      break;
+    }
+  }
+
+  printf("STEP_160\n");
+
+  if(context->status == SPF_PASS) {
+    smfi_addheader(ctx, conf.tag, "NO");
+    syslog(LOG_INFO, "EOM_Callback: addheader %s: NO ... Because SPF query for %s results PASS (OK)", conf.tag , ip);
+  }
+  else {
+    // IN the other case (=NO PASS) , add "X-MYCOMPANY-FMH: YES" header and ends.		 	
+    smfi_addheader(ctx, conf.tag, "YES");
+    syslog(LOG_INFO, "EOM_Callback: addheader %s: YES ... Because SPF query for %s results NO PASS (KO)", conf.tag , ip);		
+  }
+
+  //printf("STEP_170\n");
+
+spf_done:
+  //printf("STEP_180\n");
+   
+}
+
+// It would be undone the case of not finding any machine from a foreign domain ...
+    
+// TERMINATION (BY INTERRUPTION OR NATURAL)
+accept:
+    
+    if(context->rcpts) delete_list(context->rcpts);
+    //printf("STEP_190\n");
+    if(context->received_headers) delete_list(context->received_headers);
+    //printf("STEP_200\n");
+    if(context->received_hdrs_dnames) delete_list(context->received_hdrs_dnames);
+    //printf("STEP_210\n");
+    syslog(LOG_DEBUG, "EOM_Callback: Callback completed.");		   	       	       	    
+    return SMFIS_ACCEPT;	
+}
+
+
+
+static sfsistat smf_close(SMFICTX *ctx) {
+  struct context *context = (struct context *)smfi_getpriv(ctx);
+
+  if (context) {
+	  /*if(context->rcpts) delete_list(context->rcpts);
+	  printf("STEP_300\n");
+    if(context->received_headers) delete_list(context->received_headers);
+	  printf("STEP_310\n");
+    if(context->received_hdrs_dnames) delete_list(context->received_hdrs_dnames);
+	  printf("STEP_320\n");*/
+	  free(context);
+	  //printf("STEP_330\n");
+	  smfi_setpriv(ctx, NULL);
+   }
+   //printf("STEP_340\n");
+   return SMFIS_CONTINUE;
+}
+
+
+struct smfiDesc smfilter = {
+    "cfakemail",
+    SMFI_VERSION,
+    SMFIF_ADDHDRS|SMFIF_CHGHDRS|SMFIF_ADDRCPT|SMFIF_DELRCPT,
+    smf_connect,
+    smf_helo,
+    smf_envfrom,
+    NULL,
+    smf_header,
+    NULL,
+    NULL,
+    smf_eom,
+    NULL,
+    smf_close
+};
+
+
+
+int main(int argc, char **argv) {
+    const char *ofile = NULL;
+    int ch, ret = 0;
+
+    while ((ch = getopt(argc, argv, "hc:")) != -1) {
+	    switch (ch) {
+	        case 'h':
+		        fprintf(stderr, "Usage: cfakemail -c <config file>\n");
+		        return 0;
+	        case 'c':
+		        if (optarg) config_file = optarg;
+		        break;
+	        default:
+		        break;
+	    }
+    }
+    
+    memset(&conf, 0, sizeof(conf));
+    regcomp(&re_ipv4, IPV4_DOT_DECIMAL, REG_EXTENDED|REG_ICASE);
+    regcomp(&re_ipv4_extract, IPV4_DOT_DECIMAL_EXTRACT, REG_EXTENDED|REG_ICASE);
+    regcomp(&re_domain, DOMAIN_REGEXPR, REG_EXTENDED|REG_ICASE);
+    regcomp(&re_is_ipv4, IS_IPV4, REG_EXTENDED|REG_ICASE);
+    
+    
+    if (!load_config()) fprintf(stderr, "Warning: cfakemail configuration file load failed\n");
+    tzset();
+    openlog("cfakemail", LOG_PID|LOG_NDELAY, conf.syslog_facility);
+    if (!strncmp(conf.sendmail_socket, "unix:", 5)) 
+        ofile = conf.sendmail_socket + 5;
+    else if (!strncmp(conf.sendmail_socket, "local:", 6)) 
+        ofile = conf.sendmail_socket + 6;
+    if (ofile) unlink(ofile);
+    
+    if (!getuid()) {
+
+	    struct passwd *pw;
+
+	    if ((pw = getpwnam(conf.run_as_user)) == NULL) {
+	        fprintf(stderr, "%s: %s\n", conf.run_as_user, strerror(errno));
+	        goto done;
+	    }
+	    setgroups(1, &pw->pw_gid);
+	    if (setgid(pw->pw_gid)) {
+	        fprintf(stderr, "setgid: %s\n", strerror(errno));
+	        goto done;
+	    }
+	    if (setuid(pw->pw_uid)) {
+	        fprintf(stderr, "setuid: %s\n", strerror(errno));
+	        goto done;
+	    }
+
+
+    }
+
+
+    if (smfi_setconn((char *)conf.sendmail_socket) != MI_SUCCESS) {
+	    fprintf(stderr, "smfi_setconn failed: %s\n", conf.sendmail_socket);
+	    goto done;
+    }
+    
+    if (smfi_register(smfilter) != MI_SUCCESS) {
+	    fprintf(stderr, "smfi_register failed\n");
+	    goto done;
+    }
+    
+    if (pthread_mutex_init(&cache_mutex, 0)) {
+	    fprintf(stderr, "pthread_mutex_init failed\n");
+	    goto done;
+    }
+
+    if (pthread_mutex_init(&spf_mutex, 0)) {
+	    fprintf(stderr, "pthread_mutex_init failed\n");
+	    goto done;
+    }
+
+    umask(0177);
+    
+    if (conf.spf_ttl && !cache_init()) syslog(LOG_ERR, "[ERROR] cache engine init failed");
+    
+
+    ret = smfi_main();
+    if (ret != MI_SUCCESS) syslog(LOG_ERR, "[ERROR] terminated due to a fatal error");
+    
+    if (cache) cache_destroy();    
+    pthread_mutex_destroy(&cache_mutex);
+
+    pthread_mutex_destroy(&spf_mutex);
+
+done:
+    free_config();
+    closelog();
+    return ret;
+}
+

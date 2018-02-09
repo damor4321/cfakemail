@@ -1,0 +1,58 @@
+#!/bin/bash
+#/MTA/appn/etc/init.d/dkim
+# 2-I-2014 ~ Mensajeria BBVA (LLL)
+
+export LD_LIBRARY_PATH=/tmp/CFA/MTA/appn/lib/cfakemail/lib/libdns
+BINARY="cfakemail"
+ 
+warn () {
+  echo "$@" >&2
+}
+
+die () {
+  RC=$1
+  shift
+  warn "$@"
+  exit $RC
+}
+
+function Usage() {
+  echo "[*] Usage:"
+  echo -e "\t$0 [ start | stop | restart | status ]"
+}
+
+function Start() {
+  echo "[+] Starting $BINARY ..."
+  ((/MTA/appn/bin/$BINARY)&)
+}
+
+function Stop() {
+  PIDS="$(pgrep $BINARY)"
+  echo "[+] Stopping $BINARY ..."
+  [ -z $PIDS ] || kill -9 $PIDS
+}
+
+case "$1" in
+  start)
+    pgrep $BINARY && die 1 "[!] $BINARY is running. Only one instance is allowed! Exiting now..."
+    Start
+  ;;
+  stop)
+    pgrep $BINARY || die 2 "[!] $BINARY is NOT running! You cannot stop nothin! Exiting now..."
+    Stop
+  ;;
+  status)
+    pgrep $BINARY && die 0 "[*] $BINARY is running." || die 3 "[!] $BINARY is is NOT running!"
+  ;;
+  restart)
+    pgrep $BINARY || warn "[!] WARNING! $BINARY is NOT running! Continuing anyway..." && Stop
+    pgrep $BINARY && die 1 "[!] $BINARY is running. Only one instance is allowed! Exiting now..."
+    Start
+    echo -e "\tNew PID is $(pgrep $BINARY)"
+;;
+  *)
+    Usage
+  ;;
+esac
+
+exit 0

@@ -1,0 +1,3 @@
+La libmilter.a sólo se puede construir a partir de las fuentes de sendmail.
+La incluimos en el proyecto ya construida.
+Y subimos los fuentes sólo para su estudio y consideracion
